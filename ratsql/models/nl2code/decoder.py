@@ -76,6 +76,7 @@ def get_field_presence_info(ast_wrapper, node, field_infos):
 class NL2CodeDecoderPreprocItem:
     tree = attr.ib()
     orig_code = attr.ib()
+    orig = attr.ib()
 
 
 class NL2CodeDecoderPreproc(abstract_preproc.AbstractPreproc):
@@ -127,10 +128,17 @@ class NL2CodeDecoderPreproc(abstract_preproc.AbstractPreproc):
         self.items[section].append(
             NL2CodeDecoderPreprocItem(
                 tree=root,
-                orig_code=item.code))
+                orig_code=item.code,
+                orig=item.orig))
 
     def clear_items(self):
         self.items = collections.defaultdict(list)
+
+    def save_pred(self):
+        for section, items in self.items.items():
+            with open(os.path.join(self.data_dir, section + '.jsonl'), 'w') as f:
+                for item in items:
+                    f.write(json.dumps(attr.asdict(item)) + '\n')
 
     def save(self):
         os.makedirs(self.data_dir, exist_ok=True)
@@ -299,7 +307,6 @@ class TreeState:
     node = attr.ib()
     parent_field_type = attr.ib()
 
-
 @registry.register('decoder', 'NL2Code')
 class NL2CodeDecoder(torch.nn.Module):
     Preproc = NL2CodeDecoderPreproc
@@ -308,7 +315,6 @@ class NL2CodeDecoder(torch.nn.Module):
             self,
             device,
             preproc,
-            #
             rule_emb_size=128,
             node_embed_size=64,
             # TODO: This should be automatically inferred from encoder
@@ -322,12 +328,16 @@ class NL2CodeDecoder(torch.nn.Module):
             use_align_mat=False,
             use_align_loss=False,
             enumerate_order=False,
-            loss_type="softmax"):
+            loss_type="softmax",
+            extra_input_dim=128,
+            select_where_train_step=None
+    ):
         super().__init__()
         self._device = device
         self.preproc = preproc
         self.ast_wrapper = preproc.ast_wrapper
         self.terminal_vocab = preproc.vocab
+        self.select_where_train_step = select_where_train_step
 
         self.rule_emb_size = rule_emb_size
         self.node_emb_size = node_embed_size
@@ -367,6 +377,13 @@ class NL2CodeDecoder(torch.nn.Module):
             input_size=self.rule_emb_size * 2 + self.enc_recurrent_size + self.recurrent_size + self.node_emb_size,
             hidden_size=self.recurrent_size,
             dropout=dropout)
+
+        self.state_update_add = variational_lstm.RecurrentDropoutLSTMCell(
+            input_size=self.rule_emb_size * 2 + self.enc_recurrent_size * 2 + self.recurrent_size + self.node_emb_size,
+            hidden_size=self.recurrent_size,
+            dropout=dropout)
+
+
 
         self.attn_type = desc_attn
         if desc_attn == 'bahdanau':
@@ -452,6 +469,10 @@ class NL2CodeDecoder(torch.nn.Module):
         elif loss_type == "label_smooth":
             self.xent_loss = self.label_smooth_loss
 
+        # ========== 新增：extra_inputs 投影层 ==========
+        if extra_input_dim is not None:
+            self.extra_proj = torch.nn.Linear(extra_input_dim, enc_recurrent_size)  # 投影到 emb_size 维度
+
     def label_smooth_loss(self, X, target, smooth_value=0.1):
         if self.training:
             logits = torch.log_softmax(X, dim=1)
@@ -505,67 +526,45 @@ class NL2CodeDecoder(torch.nn.Module):
 
         return all_rules, rules_mask
 
-    def compute_loss(self, enc_input, example, desc_enc, debug):
+
+    def compute_loss(self, enc_input, example, desc_enc, debug, step=None):
         if not (self.enumerate_order and self.training):
-            mle_loss = self.compute_mle_loss(enc_input, example, desc_enc, debug)
+            mle_loss = self.compute_mle_loss(enc_input, example, desc_enc, debug, step = step)
         else:
-            mle_loss = self.compute_loss_from_all_ordering(enc_input, example, desc_enc, debug)
+            mle_loss = self.compute_loss_from_all_ordering(enc_input, example, desc_enc, debug, step = step)
 
         if self.use_align_loss:
             align_loss = self.compute_align_loss(desc_enc, example)
             return mle_loss + align_loss
         return mle_loss
 
-    def compute_loss_from_all_ordering(self, enc_input, example, desc_enc, debug):
-        def get_permutations(node):
-            def traverse_tree(node):
-                nonlocal permutations
-                if isinstance(node, (list, tuple)):
-                    p = itertools.permutations(range(len(node)))
-                    permutations.append(list(p))
-                    for child in node:
-                        traverse_tree(child)
-                elif isinstance(node, dict):
-                    for node_name in node:
-                        traverse_tree(node[node_name])
+    def _get_node_loss_weight(self, node_type):
+        """根据 AST 节点类型返回对应的损失权重"""
+        node_type = node_type.lower()
+        # 匹配节点类型到权重
+        if 'select' in node_type:
+            return self.loss_weights['select']
+        elif 'from' in node_type or 'table' in node_type or 'join' in node_type:
+            return self.loss_weights['from']
+        elif 'union' in node_type or 'intersect' in node_type:
+            return self.loss_weights['union']
+        elif 'where' in node_type or 'condition' in node_type:
+            return self.loss_weights['where']
+        elif 'group' in node_type or 'having' in node_type:
+            return self.loss_weights['groupby']
+        else:
+            return self.loss_weights['default']
 
-            permutations = []
-            traverse_tree(node)
-            return permutations
-
-        def get_perturbed_tree(node, permutation):
-            def traverse_tree(node, parent_type, parent_node):
-                if isinstance(node, (list, tuple)):
-                    nonlocal permutation
-                    p_node = [node[i] for i in permutation[0]]
-                    parent_node[parent_type] = p_node
-                    permutation = permutation[1:]
-                    for child in node:
-                        traverse_tree(child, None, None)
-                elif isinstance(node, dict):
-                    for node_name in node:
-                        traverse_tree(node[node_name], node_name, node)
-
-            node = copy.deepcopy(node)
-            traverse_tree(node, None, None)
-            return node
-
-        orig_tree = example.tree
-        permutations = get_permutations(orig_tree)
-        products = itertools.product(*permutations)
-        loss_list = []
-        for product in products:
-            tree = get_perturbed_tree(orig_tree, product)
-            example.tree = tree
-            loss = self.compute_mle_loss(enc_input, example, desc_enc)
-            loss_list.append(loss)
-        example.tree = orig_tree
-        loss_v = torch.stack(loss_list, 0)
-        return torch.logsumexp(loss_v, 0)
-
-    def compute_mle_loss(self, enc_input, example, desc_enc, debug=False):
-        traversal = TrainTreeTraversal(self, desc_enc, debug)
+    def compute_weighted_loss(self, enc_input, example, desc_enc, debug = False):
+        traversal = TrainTreeTraversal(self, desc_enc, debug)  # 理解为是一个tree 形式的全连接
         traversal.step(None)
+
+        # 增加切分
+        # object = gen_mask(example)
+        traversal.cur_item.state = TreeTraversal.State.SPLIT_TYPE
+        traversal.step(object)  # 后续 traversal.step(None)
+        traversal.cur_item.state = TreeTraversal.State.SUM_TYPE_INQUIRE
+
         queue = [
             TreeState(
                 node=example.tree,
@@ -576,6 +575,7 @@ class NL2CodeDecoder(torch.nn.Module):
             item = queue.pop()
             node = item.node
             parent_field_type = item.parent_field_type
+
 
             if isinstance(node, (list, tuple)):
                 node_type = parent_field_type + '*'
@@ -671,6 +671,194 @@ class NL2CodeDecoder(torch.nn.Module):
         else:
             return loss
 
+
+    def compute_loss_from_all_ordering(self, enc_input, example, desc_enc, debug, step=None):
+        def get_permutations(node):
+            def traverse_tree(node):
+                nonlocal permutations
+                if isinstance(node, (list, tuple)):
+                    p = itertools.permutations(range(len(node)))
+                    permutations.append(list(p))
+                    for child in node:
+                        traverse_tree(child)
+                elif isinstance(node, dict):
+                    for node_name in node:
+                        traverse_tree(node[node_name])
+
+            permutations = []
+            traverse_tree(node)
+            return permutations
+
+        def get_perturbed_tree(node, permutation):
+            def traverse_tree(node, parent_type, parent_node):
+                if isinstance(node, (list, tuple)):
+                    nonlocal permutation
+                    p_node = [node[i] for i in permutation[0]]
+                    parent_node[parent_type] = p_node
+                    permutation = permutation[1:]
+                    for child in node:
+                        traverse_tree(child, None, None)
+                elif isinstance(node, dict):
+                    for node_name in node:
+                        traverse_tree(node[node_name], node_name, node)
+
+            node = copy.deepcopy(node)
+            traverse_tree(node, None, None)
+            return node
+
+        orig_tree = example.tree
+        permutations = get_permutations(orig_tree)
+        products = itertools.product(*permutations)
+        loss_list = []
+        for product in products:
+            tree = get_perturbed_tree(orig_tree, product)
+            example.tree = tree
+            loss = self.compute_mle_loss(enc_input, example, desc_enc, step =step)
+            loss_list.append(loss)
+        example.tree = orig_tree
+        loss_v = torch.stack(loss_list, 0)
+        return torch.logsumexp(loss_v, 0)
+
+
+    def compute_mle_loss(self, enc_input, example, desc_enc, debug=False, step=None):
+        traversal = TrainTreeTraversal(self, desc_enc, debug) # 理解为是一个tree 形式的全连接
+        # 借助这个结构，会把model 移进去，算连接层，step 移动 并更新当前的输出, 计算loss
+        traversal.step(None)
+        queue = [
+            TreeState(
+                node=example.tree,
+                parent_field_type=self.preproc.grammar.root_type,
+            )
+        ]
+
+        '''
+        {'_type': 'sql', 
+        'select': {'_type': 'select', 
+             'is_distinct': False, 
+             'aggs': [{'_type': 'agg', 'agg_id': {'_type': 'Count'}, 
+             'val_unit': {'_type': 'Column', 
+             'col_unit1': {'_type': 'col_unit', 'agg_id': {'_type': 'NoneAggOp'}, 'is_distinct': False, 'col_id': 0}}}
+             ]，
+             [{'_type': 'agg', 'agg_id': {'_type': 'Count'}, 
+             'val_unit': {'_type': 'Column', 
+             'col_unit1': {'_type': 'col_unit', 'agg_id': {'_type': 'NoneAggOp'}, 'is_distinct': False, 'col_id': 0}}}
+             ]，
+             }, 
+        'from': {'_type': 'from', 'table_units': [{'_type': 'Table', 'table_id': 1}]}, 
+        'sql_where': {'_type': 'sql_where', 'where': {'_type': 'Gt', 'val_unit': {'_type': 'Column', 'col_unit1': {'_type': 'col_unit', 'agg_id': {'_type': 'NoneAggOp'}, 'is_distinct': False, 'col_id': 10}}, 'val1': {'_type': 'Terminal'}}}, 
+        'sql_groupby': {'_type': 'sql_groupby'}, 
+        'sql_orderby': {'_type': 'sql_orderby', 'limit': False}, 
+        'sql_ieu': {'_type': 'sql_ieu'}}
+        '''
+
+        while queue:
+            item = queue.pop()
+            node = item.node  # 具体的值
+
+            parent_field_type = item.parent_field_type
+            #  只训练select where
+
+            if(step < self.select_where_train_step):
+                if isinstance(node, dict) and (node['_type'] == 'sql_groupby' or node['_type'] == 'sql_orderby' or node['_type'] == 'sql_ieu'
+                or node['_type'] == 'from'):
+                    continue
+
+            if isinstance(node, (list, tuple)):
+                node_type = parent_field_type + '*'
+                rule = (node_type, len(node))
+                rule_idx = self.rules_index[rule]
+
+                assert traversal.cur_item.state == TreeTraversal.State.LIST_LENGTH_APPLY
+                traversal.step(rule_idx)
+
+                if self.preproc.use_seq_elem_rules and parent_field_type in self.ast_wrapper.sum_types:
+                    parent_field_type += '_seq_elem'
+
+                for i, elem in reversed(list(enumerate(node))):
+                    queue.append(
+                        TreeState(
+                            node=elem,
+                            parent_field_type=parent_field_type,
+                        ))
+                continue
+
+            if parent_field_type in self.preproc.grammar.pointers:
+                assert isinstance(node, int)
+                assert traversal.cur_item.state == TreeTraversal.State.POINTER_APPLY
+                pointer_map = desc_enc.pointer_maps.get(parent_field_type)
+                if pointer_map:
+                    values = pointer_map[node]
+                    if self.sup_att == '1h':
+                        if len(pointer_map) == len(enc_input['columns']):
+                            if self.attn_type != 'sep':
+                                traversal.step(values[0], values[1:], node + len(enc_input['question']))
+                            else:
+                                traversal.step(values[0], values[1:], node)
+                        else:
+                            if self.attn_type != 'sep':
+                                traversal.step(values[0], values[1:],
+                                               node + len(enc_input['question']) + len(enc_input['columns']))
+                            else:
+                                traversal.step(values[0], values[1:], node + len(enc_input['columns']))
+                    else:
+                        traversal.step(values[0], values[1:])
+                else:
+                    traversal.step(node)
+                continue
+
+            if parent_field_type in self.ast_wrapper.primitive_types:
+                # identifier, int, string, bytes, object, singleton
+                # - could be bytes, str, int, float, bool, NoneType
+                # - terminal tokens vocabulary is created by turning everything into a string (with `str`)
+                # - at decoding time, cast back to str/int/float/bool
+                field_type = type(node).__name__
+                #selct:bool,
+                field_value_split = self.preproc.grammar.tokenize_field_value(node) + [
+                    vocab.EOS]
+
+                for token in field_value_split:
+                    assert traversal.cur_item.state == TreeTraversal.State.GEN_TOKEN
+                    traversal.step(token)
+                continue
+
+            type_info = self.ast_wrapper.singular_types[node['_type']]
+
+            if parent_field_type in self.preproc.sum_type_constructors:
+                # ApplyRule, like expr -> Call
+                rule = (parent_field_type, type_info.name)
+                rule_idx = self.rules_index[rule]
+                assert traversal.cur_item.state == TreeTraversal.State.SUM_TYPE_APPLY
+                extra_rules = [
+                    self.rules_index[parent_field_type, extra_type]
+                    for extra_type in node.get('_extra_types', [])]
+                traversal.step(rule_idx, extra_rules)
+
+            if type_info.fields:
+                # ApplyRule, like Call -> expr[func] expr*[args] keyword*[keywords]
+                # Figure out which rule needs to be applied
+                present = get_field_presence_info(self.ast_wrapper, node, type_info.fields)
+                rule = (node['_type'], tuple(present))
+                rule_idx = self.rules_index[rule]
+                assert traversal.cur_item.state == TreeTraversal.State.CHILDREN_APPLY
+                traversal.step(rule_idx)
+
+            # reversed so that we perform a DFS in left-to-right order
+            for field_info in reversed(type_info.fields):
+                if field_info.name not in node:
+                    continue
+
+                queue.append(
+                    TreeState(
+                        node=node[field_info.name],
+                        parent_field_type=field_info.type,
+                    ))
+
+        loss = torch.sum(torch.stack(tuple(traversal.loss), dim=0), dim=0)
+        if debug:
+            return loss, [attr.asdict(entry) for entry in traversal.history]
+        else:
+            return loss
+
     def begin_inference(self, desc_enc, example):
         traversal = InferenceTreeTraversal(self, desc_enc, example)
         choices = traversal.step(None)
@@ -719,6 +907,65 @@ class NL2CodeDecoder(torch.nn.Module):
             dim=-1)
         new_state = self.state_update(
             # state_input shape: batch (=1) x (emb_size * 5)
+            state_input, prev_state)
+        return new_state, attention_logits
+
+    def _update_state_add(
+            self,
+            node_type,
+            prev_state,
+            prev_action_emb,
+            parent_h,
+            parent_action_emb,
+            desc_enc):
+
+        extra_inputs = desc_enc.extra_input
+
+        # ========== 原有逻辑（调整为使用 desc_enc_raw） ==========
+        # desc_context shape: batch (=1) x emb_size
+        desc_context, attention_logits = self._desc_attention(prev_state, desc_enc)
+        # node_type_emb shape: batch (=1) x emb_size
+        node_type_emb = self.node_type_embedding(
+            self._index(self.node_type_vocab, node_type))
+
+        # ========== 新增：处理 extra_inputs 并维度对齐 ==========
+        extra_emb = None
+        if extra_inputs is not None:
+            # 1. 确保 extra_inputs 维度正确 (batch=1 x extra_dim)
+            if len(extra_inputs.shape) == 1:
+                extra_inputs = extra_inputs.unsqueeze(0)  # 升维为 (1, extra_dim)
+
+            # 2. 投影到与其他输入一致的维度（关键：避免维度不匹配）
+            if hasattr(self, "extra_proj"):
+                extra_emb = self.extra_proj(extra_inputs)  # (1, emb_size)
+            else:
+                # 兜底：若未初始化投影层，直接截断/填充到 emb_size
+                emb_size = prev_action_emb.shape[-1]
+                if extra_inputs.shape[-1] > emb_size:
+                    extra_emb = extra_inputs[:, :emb_size]
+                else:
+                    padding = torch.zeros(1, emb_size - extra_inputs.shape[-1]).to(extra_inputs.device)
+                    extra_emb = torch.cat([extra_inputs, padding], dim=-1)
+
+        # ========== 改造：拼接 extra_emb 到 state_input ==========
+        state_input_list = [
+            prev_action_emb,  # a_{t-1}: rule_emb_size
+            desc_context,  # c_t: enc_recurrent_size
+            parent_h,  # s_{p_t}: recurrent_size
+            parent_action_emb,  # a_{p_t}: rule_emb_size
+            node_type_emb,  # n_{f-t}: node_emb_size
+        ]
+
+        # 新增：若有 extra_emb 则加入拼接列表
+        if extra_emb is not None:
+            state_input_list.append(extra_emb)
+
+        # 拼接所有输入（含 extra_inputs）
+        state_input = torch.cat(state_input_list, dim=-1)
+
+        # ========== 原有状态更新逻辑 ==========
+        new_state = self.state_update_add(
+            # state_input shape: batch (=1) x (emb_size * 5/6)（含 extra 则为 6 倍）
             state_input, prev_state)
         return new_state, attention_logits
 
@@ -879,3 +1126,4 @@ class NL2CodeDecoder(torch.nn.Module):
             # TODO batching
             range(logits.shape[1]),
             logprobs[0]))
+

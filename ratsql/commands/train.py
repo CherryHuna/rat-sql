@@ -3,6 +3,7 @@ import collections
 import datetime
 import json
 import os
+from typing import Union, Any
 
 import _jsonnet
 import attr
@@ -36,7 +37,7 @@ class TrainConfig:
     keep_every_n = attr.ib(default=1000)
 
     batch_size = attr.ib(default=32)
-    eval_batch_size = attr.ib(default=32)
+    eval_batch_size: Union[int, Any] = attr.ib(default=32)
     max_steps = attr.ib(default=100000)
     num_eval_items = attr.ib(default=None)
     eval_on_train = attr.ib(default=True)
@@ -52,6 +53,7 @@ class TrainConfig:
 
     num_batch_accumulated = attr.ib(default=1)
     clip_grad = attr.ib(default=None)
+    train_select_step = attr.ib(default=None)
 
 
 class Logger:
@@ -76,7 +78,7 @@ class Logger:
 
 
 class Trainer:
-    def __init__(self, logger, config):
+    def __init__(self, logger, config, arg):
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
         else:
@@ -99,8 +101,20 @@ class Trainer:
             # 1. Construct model
             self.model = registry.construct('model', config['model'],
                                             unused_keys=('encoder_preproc', 'decoder_preproc'),
-                                            preproc=self.model_preproc, device=self.device)
+                                            preproc=self.model_preproc, device=self.device,
+                                            args=arg)
             self.model.to(self.device)
+
+            # ===== 新增：验证模型参数设备 =====
+            print("\n=== 模型参数设备验证 ===")
+            # 随机取 BERT 核心参数和下游层参数验证
+            # bert_param = next(self.encoder.bert_model.parameters())
+            decoder_param = next(self.model.decoder.parameters())
+            # print(f"BERT 核心参数设备：{bert_param.device}")
+            print(f"解码器参数设备：{decoder_param.device}")
+            # 必须输出：mps:0（而非 cpu）
+            # assert str(bert_param.device) == "mps:0", "BERT 模型未移至 MPS！"
+            # assert str(decoder_param.device) == "mps:0", "解码器未移至 MPS！"
 
     def train(self, config, modeldir):
         # slight difference here vs. unrefactored train: The init_random starts over here.
@@ -120,13 +134,14 @@ class Trainer:
                     if "bert" not in name:
                         non_bert_params.append(_param)
                 assert len(non_bert_params) + len(bert_params) == len(list(self.model.parameters()))
-
                 optimizer = registry.construct('optimizer', config['optimizer'], non_bert_params=non_bert_params,
-                                               bert_params=bert_params)
+                                               bert_params=bert_params,
+                                               lr=1e-3, bert_lr=2e-5, weight_decay=0.01)
+
+
                 lr_scheduler = registry.construct('lr_scheduler',
                                                   config.get('lr_scheduler', {'name': 'noop'}),
-                                                  param_groups=[optimizer.non_bert_param_group,
-                                                                optimizer.bert_param_group])
+                                                  param_groups=non_bert_params)
             else:
                 optimizer = registry.construct('optimizer', config['optimizer'], params=self.model.parameters())
                 lr_scheduler = registry.construct('lr_scheduler',
@@ -138,7 +153,7 @@ class Trainer:
             {"model": self.model, "optimizer": optimizer}, keep_every_n=self.train_config.keep_every_n)
         last_step = saver.restore(modeldir, map_location=self.device)
 
-        #lr fix to not break scheduler when loading from checkpoint
+        # lr fix to not break scheduler when loading from checkpoint
         lr_scheduler.param_groups = optimizer.param_groups
 
         if "pretrain" in config and last_step == 0:
@@ -190,6 +205,146 @@ class Trainer:
                 with self.model_random:
                     for _i in range(self.train_config.num_batch_accumulated):
                         if _i > 0:  batch = next(train_data_loader)
+                        loss = self.model.compute_loss(batch, step=last_step)
+                        norm_loss = loss / self.train_config.num_batch_accumulated
+                        norm_loss.backward()
+
+                    if self.train_config.clip_grad:
+                        torch.nn.utils.clip_grad_norm_(optimizer.bert_param_group["params"], \
+                                                       self.train_config.clip_grad)
+                    optimizer.step()
+                    lr_scheduler.update_lr(last_step)
+                    optimizer.zero_grad()
+
+                # Report metrics
+                if last_step % self.train_config.report_every_n == 0:
+                    self.logger.log(f'Step {last_step}: loss={loss.item():.4f}')
+
+                last_step += 1
+                # Run saver
+                if last_step == 1 or last_step % self.train_config.save_every_n == 0:
+                    saver.save(modeldir, last_step)
+
+                # 第一阶段训练拿到select
+                if last_step >= self.train_config.train_select_step:
+                    # bert 停止学习
+                    self.model.encoder.freeze_bert(4)
+                    # saver.save(modeldir+"/first", last_step)
+
+            # Save final model
+            saver.save(modeldir, last_step)
+
+    def train_two_stage_bk(self, config, modeldir):
+        with self.init_random:
+            param_groups = self.model.get_sql_component_param_groups()
+            # 打印分组信息（调试用）
+            print("=== SQL Component Parameter Groups ===")
+            total_params = 0
+            for i, group in enumerate(param_groups):
+                param_count = len(group['params'])
+                total_params += param_count
+                print(f"Group {i}: {group['name']}")
+                print(f"  - LR: {group['lr']:.6f}")
+                print(f"  - Weight Decay: {group['weight_decay']}")
+                print(f"  - Params: {param_count}")
+            print(f"Total Trainable Params: {total_params}")
+
+            # TODO: not nice
+            if config["optimizer"].get("name", None) == 'bertAdamw':
+                bert_params = list(self.model.encoder.bert_model.parameters())
+                assert len(bert_params) > 0
+                non_bert_params = []
+                for name, _param in self.model.named_parameters():
+                    if "bert" not in name:
+                        non_bert_params.append(_param)
+                assert len(non_bert_params) + len(bert_params) == len(list(self.model.parameters()))
+
+                optimizer = registry.construct('optimizer', config['optimizer'], non_bert_params=non_bert_params,
+                                               bert_params=bert_params, object_param_groups=param_groups,
+                                               lr=1e-3, bert_lr=2e-5, weight_decay=0.01)
+                lr_scheduler = registry.construct('lr_scheduler',
+                                                  config.get('lr_scheduler', {'name': 'noop'}),
+                                                  param_groups=[optimizer.non_bert_param_group,
+                                                                optimizer.bert_param_group].append(param_groups),
+                                                  num_warmup_steps=1000)
+            else:
+                optimizer = registry.construct('optimizer', config['optimizer'], params=self.model.parameters(), )
+                lr_scheduler = registry.construct('lr_scheduler',
+                                                  config.get('lr_scheduler', {'name': 'noop'}),
+                                                  param_groups=optimizer.param_groups)
+
+        # 2. Restore model parameters
+        saver = saver_mod.Saver(
+            {"model": self.model, "optimizer": optimizer}, keep_every_n=self.train_config.keep_every_n)
+        last_step = saver.restore(modeldir, map_location=self.device)
+
+        # lr fix to not break scheduler when loading from checkpoint
+        lr_scheduler.param_groups = optimizer.param_groups
+
+        if "pretrain" in config and last_step == 0:
+            pretrain_config = config["pretrain"]
+            _path = pretrain_config["pretrained_path"]
+            _step = pretrain_config["checkpoint_step"]
+            pretrain_step = saver.restore(_path, step=_step, map_location=self.device, item_keys=["model"])
+            saver.save(modeldir, pretrain_step)  # for evaluating pretrained models
+            last_step = pretrain_step
+
+        # 3. Get training data somewhere
+        with self.data_random:
+            train_data = self.model_preproc.dataset('train')
+            train_data_loader = self._yield_batches_from_epochs(
+                torch.utils.data.DataLoader(
+                    train_data,
+                    batch_size=self.train_config.batch_size,
+                    shuffle=True,
+                    drop_last=True,
+                    collate_fn=lambda x: x))
+        train_eval_data_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.train_config.eval_batch_size,
+            collate_fn=lambda x: x)
+
+        val_data = self.model_preproc.dataset('val')
+        val_data_loader = torch.utils.data.DataLoader(
+            val_data,
+            batch_size=self.train_config.eval_batch_size,
+            collate_fn=lambda x: x)
+
+        # 4. Start training loop
+        with self.data_random:
+            for batch in train_data_loader:
+                # Quit if too long
+                if last_step >= self.train_config.max_steps:
+                    break
+                if last_step == self.train_config.step_stage_1 and \
+                        config["optimizer"].get("name", None) == 'bertAdamw':
+                    print("\n===== 切换到阶段 2：解冻 BERT 最后 4 层，开始微调 =====")
+                    # 解冻 BERT 最后 4 层
+                    self.model.encoder.freeze_bert(except_last_n_layers=4)
+                    # 切换到阶段 2 优化器
+                    optimizer = registry.construct('optimizer', config['optimizer'], non_bert_params=non_bert_params,
+                                                   bert_params=bert_params, lr=1e-3, bert_lr=2e-5, weight_decay=0.01)
+                    lr_scheduler = registry.construct('lr_scheduler',
+                                                      config.get('lr_scheduler', {'name': 'noop'}),
+                                                      param_groups=[optimizer.non_bert_param_group,
+                                                                    optimizer.bert_param_group], num_warmup_steps=1000)
+                    # num_warmup_steps，learn_rate, num_warmip_steps，weight_decay;
+                    # 分层学习率
+                    # 先学习哪部分再学习哪部分：学习步数、单独设置微调步数，后面就不微调了；
+
+                # Evaluate model
+                if last_step % self.train_config.eval_every_n == 0:
+                    if self.train_config.eval_on_train:
+                        self._eval_model(self.logger, self.model, last_step, train_eval_data_loader, 'train',
+                                         num_eval_items=self.train_config.num_eval_items)
+                    if self.train_config.eval_on_val:
+                        self._eval_model(self.logger, self.model, last_step, val_data_loader, 'val',
+                                         num_eval_items=self.train_config.num_eval_items)
+
+                # Compute and apply gradient
+                with self.model_random:
+                    for _i in range(self.train_config.num_batch_accumulated):
+                        if _i > 0:  batch = next(train_data_loader)
                         loss = self.model.compute_loss(batch)
                         norm_loss = loss / self.train_config.num_batch_accumulated
                         norm_loss.backward()
@@ -225,7 +380,7 @@ class Trainer:
         model.eval()
         with torch.no_grad():
             for eval_batch in eval_data_loader:
-                batch_res = model.eval_on_batch(eval_batch)
+                batch_res = model.eval_on_batch(eval_batch, step=last_step)
                 for k, v in batch_res.items():
                     stats[k] += v
                 if num_eval_items and stats['total'] > num_eval_items:
@@ -273,7 +428,7 @@ def main(args):
     logger.log(f'Logging to {args.logdir}')
 
     # Construct trainer and do training
-    trainer = Trainer(logger, config)
+    trainer = Trainer(logger, config, args)
     trainer.train(config, modeldir=args.logdir)
 
 

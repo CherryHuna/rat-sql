@@ -14,6 +14,7 @@ from ratsql.utils import registry
 from ratsql.datasets.spider_lib import evaluation
 
 
+
 @attr.s
 class SpiderItem:
     text = attr.ib()
@@ -125,37 +126,37 @@ def load_tables(paths):
 
 @registry.register('dataset', 'spider')
 class SpiderDataset(torch.utils.data.Dataset):
-    def __init__(self, paths, tables_paths, db_path, demo_path=None, limit=None):
+    def __init__(self, paths, tables_paths, db_path, demo_path=None, limit=None, connect=True):
         self.paths = paths
         self.db_path = db_path
         self.examples = []
 
         self.schemas, self.eval_foreign_key_maps = load_tables(tables_paths)
 
-        for path in paths:
-            raw_data = json.load(open(path))
-            for entry in raw_data:
-                item = SpiderItem(
-                    text=entry['question_toks'],
-                    code=entry['sql'],
-                    schema=self.schemas[entry['db_id']],
-                    orig=entry,
-                    orig_schema=self.schemas[entry['db_id']].orig)
-                self.examples.append(item)
+        if paths is not None:
+            for path in paths:
+                raw_data = json.load(open(path))
+                for entry in raw_data:
+                    item = SpiderItem(
+                        text=entry['question_toks'],
+                        code=entry['sql'],
+                        schema=self.schemas[entry['db_id']],
+                        orig=entry,
+                        orig_schema=self.schemas[entry['db_id']].orig)
+                    self.examples.append(item)
         
         if demo_path:
             self.demos: Dict[str, List] = json.load(open(demo_path))
-            
-        # Backup in-memory copies of all the DBs and create the live connections
-        for db_id, schema in tqdm(self.schemas.items(), desc="DB connections"):
-            sqlite_path = Path(db_path) / db_id / f"{db_id}.sqlite"
-            source: sqlite3.Connection
-            with sqlite3.connect(str(sqlite_path)) as source:
-                dest = sqlite3.connect(':memory:')
-                dest.row_factory = sqlite3.Row
-                source.backup(dest)
-            schema.connection = dest
-            
+        if connect:
+            # Backup in-memory copies of all the DBs and create the live connections
+            for db_id, schema in tqdm(self.schemas.items(), desc="DB connections"):
+                sqlite_path = Path(db_path) / db_id / f"{db_id}.sqlite"
+                source: sqlite3.Connection
+                with sqlite3.connect(str(sqlite_path)) as source:
+                    dest = sqlite3.connect(':memory:')
+                    dest.row_factory = sqlite3.Row
+                    source.backup(dest)
+                schema.connection = dest
 
     def __len__(self):
         return len(self.examples)
@@ -167,7 +168,60 @@ class SpiderDataset(torch.utils.data.Dataset):
         for _, schema in self.schemas.items():
             if schema.connection:
                 schema.connection.close()
-    
+
+    def addData(self, raw_data):
+        for entry in raw_data:
+            item = SpiderItem(
+                text=entry['question_toks'],
+                code=entry['sql'],
+                schema=self.schemas[entry['db_id']],
+                orig=entry,
+                orig_schema=self.schemas[entry['db_id']].orig,
+                 )
+            self.examples.append(item)
+
+    def collate_fn(batch):
+        """批处理函数，新增node_types收集"""
+        # 原有逻辑：整理input_ids、attention_mask、targets等
+        input_ids = torch.stack([item['input_ids'] for item in batch])
+        attention_mask = torch.stack([item['attention_mask'] for item in batch])
+        targets = torch.stack([item['targets'] for item in batch])
+
+        # 收集每个target token对应的AST节点类型
+        node_types = [item['node_types'] for item in batch]
+        # 补齐到相同长度（用'default'填充）
+        max_len = max(len(nt) for nt in node_types)
+        padded_node_types = []
+        for nt in node_types:
+            padded_nt = nt + ['default'] * (max_len - len(nt))
+            padded_node_types.append(padded_nt)
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'targets': targets,
+            'node_types': padded_node_types,  # 新增节点类型信息
+            # 原有其他字段（如schema信息）
+        }
+
+    def process_sql_ast(ast):
+        """解析SQL AST，为每个生成token标注节点类型"""
+        # 递归遍历AST，为每个token分配节点类型（如'select_column'/'from_table'等）
+        node_types = []
+
+        def traverse(node, parent_type):
+            if 'type' in node:
+                current_type = node['type']
+                # 记录当前节点对应的token类型
+                if 'value' in node and node['value']:
+                    node_types.append(f"{parent_type}_{current_type}")
+                # 递归遍历子节点
+                for child in node.get('children', []):
+                    traverse(child, current_type)
+
+        traverse(ast, 'root')
+        return node_types
+
     class Metrics:
         def __init__(self, dataset):
             self.dataset = dataset

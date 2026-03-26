@@ -82,8 +82,8 @@ class InferenceTreeTraversal(TreeTraversal):
             for orig_index, mapped_indices in pointer_map.items()
         ]
 
-    def update_using_last_choice(self, last_choice, extra_choice_info, attention_offset):
-        super().update_using_last_choice(last_choice, extra_choice_info, attention_offset)
+    def update_using_last_choice(self, last_choice, extra_choice_info, attention_offset, weight):
+        super().update_using_last_choice(last_choice, extra_choice_info, attention_offset, weight)
 
         # Record actions
         # CHILDREN_INQUIRE

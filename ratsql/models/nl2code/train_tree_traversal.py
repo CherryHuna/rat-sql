@@ -80,8 +80,8 @@ class TrainTreeTraversal(TreeTraversal):
         self.choice_point = self.XentChoicePoint(logits)
         self.attention_choice = self.XentChoicePoint(attention_logits)
 
-    def update_using_last_choice(self, last_choice, extra_choice_info, attention_offset):
-        super().update_using_last_choice(last_choice, extra_choice_info, attention_offset)
+    def update_using_last_choice(self, last_choice, extra_choice_info, attention_offset, weight):
+        super().update_using_last_choice(last_choice, extra_choice_info, attention_offset, weight)
         if last_choice is None:
             return
 
@@ -92,12 +92,15 @@ class TrainTreeTraversal(TreeTraversal):
                 self.model.preproc.all_rules[rule_idx][1]
                 for rule_idx in valid_choice_indices]
 
+
         self.loss = self.loss.append(
-                self.choice_point.compute_loss(self, last_choice, extra_choice_info))
-        
+                self.choice_point.compute_loss(self, last_choice, extra_choice_info) * weight)
         if attention_offset is not None and self.attention_choice is not None:
             self.loss = self.loss.append(
                 self.attention_choice.compute_loss(self, attention_offset, extra_indices=None))
         
         self.choice_point = None
         self.attention_choice = None
+
+
+

@@ -1,7 +1,7 @@
 import attr
 import math
 import torch
-import transformers
+from torch.optim import AdamW
 
 from ratsql.utils import registry
 
@@ -90,14 +90,15 @@ class NoOpLRScheduler:
 
 
 @registry.register('optimizer', 'bertAdamw')
-class BertAdamW(transformers.AdamW):
+class BertAdamW(AdamW):
     """
     Given a model and its bert module, create parameter groups with different lr
     """
 
-    def __init__(self, non_bert_params, bert_params, lr=1e-3, bert_lr=2e-5, **kwargs):
-        self.bert_param_group = {"params": bert_params, "lr": bert_lr, "weight_decay": 0}
+    def __init__(self, non_bert_params, bert_params, lr=1e-3, bert_lr=2e-5, weight_decay=0, **kwargs):
+        self.bert_param_group = {"params": bert_params, "lr": bert_lr, "weight_decay": weight_decay}
         self.non_bert_param_group = {"params": non_bert_params}
+        # self.non_bert_param_group12= {"params": self.bert_model.encoder.layer[:12].parameters()}
 
         params = [self.non_bert_param_group, self.bert_param_group]
         if "name" in kwargs: del kwargs["name"]  # TODO: fix this
@@ -121,11 +122,16 @@ class BertWarmupPolynomialLRSchedulerGroup(WarmupPolynomialLRScheduler):
                     new_lr = start_lr * warmup_frac_done
                 else:  # fix bert during warm-up
                     assert i == 1
-                    new_lr = 0
+                    new_lr = 0 # BERT层学习率强制为0，参数不更新
             else:
                 new_lr = (
                         (start_lr - self.end_lr) * (
                             1 - (current_step - self.num_warmup_steps) / self.decay_steps) ** self.power
                         + self.end_lr)
+            # 学习率随步数逐步下降，且不会低于
+            # end_lr，保证后期微调难样本时的稳定性
 
             param_group['lr'] = new_lr
+
+
+# 一开始学习率是很大的，bert是冻结的，在11000步开始放开调试， 21000步开始出现过拟合现象

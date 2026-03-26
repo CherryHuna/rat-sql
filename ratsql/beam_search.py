@@ -14,7 +14,17 @@ class Hypothesis:
     score_history = attr.ib(factory=list)
 
 
+# 束搜索
 def beam_search(model, orig_item, preproc_item, beam_size, max_steps):
+    '''
+        def begin_inference(self, orig_item, preproc_item):
+        enc_input, _ = preproc_item
+        if getattr(self.encoder, 'batched'):
+            enc_state, = self.encoder([enc_input])
+        else:
+            enc_state = self.encoder(enc_input)
+        return self.decoder.begin_inference(enc_state, orig_item)
+    '''
     inference_state, next_choices = model.begin_inference(orig_item, preproc_item)
     beam = [Hypothesis(inference_state, next_choices)]
     finished = []

@@ -17,8 +17,9 @@ def add_parser():
 
 
 def main(args):
-    real_logdir, metrics = evaluation.compute_metrics(args.config, args.config_args, args.section, args.inferred,
-                                                      args.logdir)
+    real_logdir, metrics = \
+        evaluation.compute_metrics(
+            args.config, args.config_args, args.section, args.inferred, args.logdir)
 
     if args.output:
         if real_logdir:

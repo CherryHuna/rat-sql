@@ -51,6 +51,7 @@ class TreeTraversal:
         POINTER_INQUIRE = 7
         POINTER_APPLY = 8
         NODE_FINISHED = 9
+        SPLIT_TYPE = 10
 
     def __init__(self, model, desc_enc):
         if model is None:
@@ -97,12 +98,17 @@ class TreeTraversal:
         other.update_prev_action_emb = self.update_prev_action_emb
         return other
 
-    def step(self, last_choice, extra_choice_info=None, attention_offset=None):
+    def step(self, last_choice, extra_choice_info=None, attention_offset=None, weight=1):
         while True:
+            # 先走嵌入层，再都预测值，真实值，更新嵌入
+            # 再计算loss
+            # encoder
             self.update_using_last_choice(
-                last_choice, extra_choice_info, attention_offset
+                last_choice, extra_choice_info, attention_offset, weight
             )
 
+            # 计算完以后lstm算预测值，真实值，更新嵌入
+            # apply_rule-》update_state
             handler_name = TreeTraversal.Handler.handlers[self.cur_item.state]
             handler = getattr(self, handler_name)
             choices, continued = handler(last_choice)
@@ -113,7 +119,7 @@ class TreeTraversal:
                 return choices
 
     def update_using_last_choice(
-            self, last_choice, extra_choice_info, attention_offset
+            self, last_choice, extra_choice_info, attention_offset, weight
     ):
         if last_choice is None:
             return
@@ -164,7 +170,40 @@ class TreeTraversal:
         self.update_prev_action_emb = (
             TreeTraversal._update_prev_action_emb_apply_rule
         )
+
+
+        # self.cur_item = attr.evolve(
+        #     self.cur_item,
+        #     node_type=singular_type,
+        #     parent_action_emb=self.prev_action_emb,
+        #     state=TreeTraversal.State.CHILDREN_INQUIRE,
+        # )
         choices = self.rule_choice(self.cur_item.node_type, rule_logits)
+        return choices, False
+
+    @Handler.register_handler(State.SPLIT_TYPE)
+    def process_spilt_apply(self, last_choice):
+    # b. Add action, prepare for #2
+        if last_choice == vocab.EOS:
+            if self.pop():
+                last_choice = None
+                return last_choice, True
+            else:
+                return None, False
+
+        self.recurrent_state, output, gen_logodds = self.model.gen_token(
+            self.cur_item.node_type,
+            self.recurrent_state,
+            self.prev_action_emb,
+            self.cur_item.parent_h,
+            self.cur_item.parent_action_emb,
+            self.desc_enc,
+        )
+        self.update_prev_action_emb = (
+            TreeTraversal._update_prev_action_emb_gen_token
+        )
+        choices = self.token_choice(output, gen_logodds)
+
         return choices, False
 
     @Handler.register_handler(State.SUM_TYPE_APPLY)
@@ -386,6 +425,8 @@ class TreeTraversal:
             self.cur_item.node_type, logits, attention_logits
         )
         return choices, False
+
+
 
     @Handler.register_handler(State.POINTER_APPLY)
     def process_pointer_apply(self, last_choice):

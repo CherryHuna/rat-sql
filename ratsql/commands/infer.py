@@ -66,7 +66,7 @@ class Inferer:
                 else:
                     sliced_orig_data = orig_data
                     sliced_preproc_data = preproc_data
-                assert len(orig_data) == len(preproc_data)
+                # assert len(orig_data) == len(preproc_data)
                 self._inner_infer(model, args.beam_size, args.output_history, sliced_orig_data, sliced_preproc_data,
                                   output, args.use_heuristic)
             elif args.mode == 'debug':
@@ -76,7 +76,18 @@ class Inferer:
                 else:
                     sliced_data = data
                 self._debug(model, sliced_data, output)
-            
+
+    def infer_pred(self, model, orig_data):
+        with torch.no_grad():
+            preproc_data = self.model_preproc.dataset('val')
+            sliced_orig_data = orig_data
+            sliced_preproc_data = preproc_data
+
+            for i, (orig_item, preproc_item) in enumerate(
+                   zip(sliced_orig_data, sliced_preproc_data)):
+                decoded = self._infer_one(model, orig_item, preproc_item, 1, False, False)
+            return decoded
+
 
     def _inner_infer(self, model, beam_size, output_history, sliced_orig_data, sliced_preproc_data, output,
                      use_heuristic=True):
@@ -90,6 +101,7 @@ class Inferer:
                     'beams': decoded,
                 }) + '\n')
             output.flush()
+            break
 
     def _infer_one(self, model, data_item, preproc_item, beam_size, output_history=False, use_heuristic=True):
         if use_heuristic:

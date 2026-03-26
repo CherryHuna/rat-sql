@@ -51,6 +51,10 @@ def main():
     parser.add_argument('exp_config_file', help="jsonnet file for experiments")
     parser.add_argument('--model_config_args', help="optional overrides for model config args")
     parser.add_argument('--logdir', help="optional override for logdir")
+
+    parser.add_argument('--select_lr', type=float, default=None, help='SELECT 子句学习率')
+    parser.add_argument('--from_lr', type=float, default=None, help='FROM 子句学习率')
+    parser.add_argument('--union_lr', type=float, default=None, help='UNION 子句学习率')
     args = parser.parse_args()
 
     exp_config = json.loads(_jsonnet.evaluate_file(args.exp_config_file))

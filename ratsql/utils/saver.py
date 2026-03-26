@@ -37,7 +37,10 @@ def load_checkpoint(item_dict, model_dir, map_location=None, step=None):
                 checkpoint['model'][key] = old_state_dict[key]
 
         for item_name in item_dict:
-            item_dict[item_name].load_state_dict(checkpoint[item_name])
+            if item_name == 'model':
+                item_dict[item_name].load_state_dict(checkpoint[item_name], strict = False)
+            else:
+                item_dict[item_name].load_state_dict(checkpoint[item_name])
         return checkpoint.get('step', 0)
     return 0
 

@@ -76,8 +76,14 @@ class RecurrentDropoutLSTMCell(torch.jit.ScriptModule):
 
     @classmethod
     def _hook_remove_dropout_masks_from_state_dict(cls, instance, state_dict, prefix, local_metadata):
-        del state_dict[prefix + '_input_dropout_mask']
-        del state_dict[prefix + '_h_dropout_mask']
+        # 增加键存在性判断，避免 KeyError
+        mask_key = prefix + '_input_dropout_mask'
+        if mask_key in state_dict:
+            del state_dict[mask_key]
+        # 若还有其他 mask 键（如 _output_dropout_mask），同理补充判断
+        h_mask_key = prefix + '_h_dropout_mask'
+        if h_mask_key in state_dict:
+            del state_dict[h_mask_key]
 
     def _hook_add_dropout_masks_to_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys,
                                               unexpected_keys, error_msgs):

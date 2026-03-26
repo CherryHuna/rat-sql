@@ -1,7 +1,9 @@
 import collections
+import dataclasses
 import itertools
 import json
 import os
+import re
 
 import attr
 import numpy as np
@@ -33,6 +35,8 @@ class SpiderEncoderState:
 
     m2c_align_mat = attr.ib()
     m2t_align_mat = attr.ib()
+
+    extra_input = attr.ib()
 
     def find_word_occurrences(self, word):
         return [i for i, w in enumerate(self.words) if w == word]
@@ -124,7 +128,6 @@ def preprocess_schema_uncached(schema,
     ]
 
     return r
-
 
 class SpiderEncoderV2Preproc(abstract_preproc.AbstractPreproc):
 
@@ -537,6 +540,7 @@ class SpiderEncoderV2(torch.nn.Module):
                 },
                 m2c_align_mat=align_mat_item[0],
                 m2t_align_mat=align_mat_item[1],
+                extra_input=None
             ))
         return result
 
@@ -665,7 +669,8 @@ class SpiderEncoderBertPreproc(SpiderEncoderV2Preproc):
         self.counted_db_ids = set()
         self.preprocessed_schemas = {}
 
-        self.tokenizer = BertTokenizer.from_pretrained(bert_version)
+        # self.tokenizer = BertTokenizer.from_pretrained(bert_version)
+        self.tokenizer = BertTokenizer.from_pretrained("/Users/huangna/work2026/ratsql/models")
 
         # TODO: should get types from the data
         column_types = ["text", "number", "time", "boolean", "others"]
@@ -757,6 +762,7 @@ class SpiderEncoderBert(torch.nn.Module):
             self,
             device,
             preproc,
+            train_select_step=None,
             update_config={},
             bert_token_type=False,
             bert_version="bert-base-uncased",
@@ -766,6 +772,7 @@ class SpiderEncoderBert(torch.nn.Module):
         super().__init__()
         self._device = device
         self.preproc = preproc
+        self.train_select_step = train_select_step
         self.bert_token_type = bert_token_type
         self.base_enc_hidden_size = 1024 if bert_version == "bert-large-uncased-whole-word-masking" else 768
 
@@ -791,11 +798,51 @@ class SpiderEncoderBert(torch.nn.Module):
             sc_link=True,
         )
 
-        self.bert_model = BertModel.from_pretrained(bert_version)
+        # self.bert_model = BertModel.from_pretrained(bert_version)
+        self.bert_model = BertModel.from_pretrained(
+            "/Users/huangna/work2026/ratsql/models")
         self.tokenizer = self.preproc.tokenizer
         self.bert_model.resize_token_embeddings(len(self.tokenizer))  # several tokens added
 
-    def forward(self, descs):
+    def freeze_bert(self, except_last_n_layers=0):
+        # 先冻结所有 BERT 参数
+        for param in self.bert_model.parameters():
+            param.requires_grad = False
+
+        # 解冻最后 N 层（阶段 2 用）
+        if except_last_n_layers > 0:
+            # bert-large 有 24 层，取最后 N 层
+            layers_to_unfreeze = self.bert_model.encoder.layer[-except_last_n_layers:]
+            for layer in layers_to_unfreeze:
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+        # 验证冻结状态（可选，调试用）
+        frozen_count = 0
+        unfrozen_count = 0
+        for name, param in self.bert_model.named_parameters():
+            if param.requires_grad:
+                unfrozen_count += 1
+                print(f"✅ 解冻参数：{name}")
+            else:
+                frozen_count += 1
+        print(f"\nBERT 冻结参数数：{frozen_count}，解冻参数数：{unfrozen_count}")
+
+    '''
+    descs信息
+    {'raw_question': 'How many heads of the departments are older than 56 ?', 
+    'question': ['how', 'many', 'heads', 'of', 'the', 'departments', 'are', 'older', 'than', '56', '?'], 
+    'db_id': 'department_management', 
+    'sc_link': {'q_col_match': {'2,7': 'CPM', '2,12': 'CPM', '5,1': 'CPM', '5,11': 'CPM'}, 'q_tab_match': {'2,1': 'TEM', '5,0': 'TEM'}}, 
+    'cv_link': {'num_date_match': {'9,1': 'NUMBER', '9,4': 'NUMBER', '9,5': 'NUMBER', '9,6': 'NUMBER', '9,7': 'NUMBER', '9,10': 'NUMBER', '9,11': 'NUMBER', '9,12': 'NUMBER'}, 'cell_match': {}}, 
+    'columns': [['*', '<type: text>'], ['department', 'id', '<type: number>'], ['name', '<type: text>'], ['creation', '<type: text>'], ['ranking', '<type: number>'], ['budget', 'in', 'billions', '<type: number>'], ['nu', '##m', 'employees', '<type: number>'], ['head', 'id', '<type: number>'], ['name', '<type: text>'], ['born', 'state', '<type: text>'], ['age', '<type: number>'], ['department', 'id', '<type: number>'], ['head', 'id', '<type: number>'], ['temporary', 'acting', '<type: text>']], 'tables': [['department'], ['head'], ['management']], 'table_bounds': [1, 7, 11, 14], 'column_to_table': {'0': None, '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 1, '8': 1, '9': 1, '10': 1, '11': 2, '12': 2, '13': 2}, 'table_to_columns': {'0': [1, 2, 3, 4, 5, 6], '1': [7, 8, 9, 10], '2': [11, 12, 13]}, 'foreign_keys': {'11': 1, '12': 7}, 
+    'foreign_keys_tables': {'2': [0, 1]}, 
+    'primary_keys': [1, 7, 11]}
+
+    '''
+
+    def forward(self, descs, step=None, descs_first=None):
+
         batch_token_lists = []
         batch_id_to_retrieve_question = []
         batch_id_to_retrieve_column = []
@@ -806,6 +853,41 @@ class SpiderEncoderBert(torch.nn.Module):
         long_seq_set = set()
         batch_id_map = {}  # some long examples are not included
         for batch_idx, desc in enumerate(descs):
+            if step < self.train_select_step:
+                sql = descs_first[batch_idx].orig['query']
+                # 匹配 select 和 from
+                # 1. 匹配 SELECT 和 FROM 之间的内容（提取查询字段）
+                select_pattern = r'SELECT\s+(.*?)\s+FROM'
+                select_match = re.search(select_pattern, sql, re.IGNORECASE)
+                select_result = select_match.group(1).strip() if select_match else ""
+
+                # 2. 匹配 FROM 和 WHERE 之间的内容（提取表名）
+                where_pattern = r'WHERE\s+(.*?)\s'
+                where_match = re.search(where_pattern, sql, re.IGNORECASE)
+                where_result = where_match.group(1).strip() if where_match else ""
+
+                having_pattern = r'HAVING\s+(.*?)\s'
+                having_match = re.search(having_pattern, sql, re.IGNORECASE)
+                having_result = having_match.group(1).strip() if having_match else ""
+
+                def get_content(s):
+                    left = s.find("(")
+                    right = s.find(")")
+                    # 有括号才提取，无括号直接返回原字符串
+                    if left != -1 and right != -1 and right > left:
+                        return s[left + 1:right]
+                    return s
+
+                desc['question'].append("SELEC")
+                desc['question'].append(":")
+                [desc['question'].append(get_content(each)) for each in select_result.split(",")]
+                desc['question'].append("WHERE")
+                desc['question'].append(":")
+                [desc['question'].append(get_content(each)) for each in where_result.split(",")]
+                desc['question'].append("HAVING")
+                desc['question'].append(":")
+                [desc['question'].append(get_content(each)) for each in having_result.split(",")]
+
             qs = self.pad_single_sentence_for_bert(desc['question'], cls=True)
             if self.use_column_type:
                 cols = [self.pad_single_sentence_for_bert(c, cls=False) for c in desc['columns']]
@@ -909,6 +991,7 @@ class SpiderEncoderBert(torch.nn.Module):
             assert col_enc.size()[0] == c_boundary[-1]
             assert tab_enc.size()[0] == t_boundary[-1]
 
+
             q_enc_new_item, c_enc_new_item, t_enc_new_item, align_mat_item = \
                 self.encs_update.forward_unbatched(
                     desc,
@@ -918,6 +1001,12 @@ class SpiderEncoderBert(torch.nn.Module):
                     tab_enc.unsqueeze(1),
                     t_boundary)
 
+            # q_enc_new_item, c_enc_new_item;
+            # copy_attention
+            # 做一个数据标准化，分词查找关联的表，至少可以搞一个排除法，决定选哪一个就用；
+            # 基于词嵌入搞一个只选择select表的东西，增加我们的特殊信息，或者是预测到了
+            # 把隐藏的信息给出来；
+
             memory = []
             if 'question' in self.include_in_memory:
                 memory.append(q_enc_new_item)
@@ -926,6 +1015,7 @@ class SpiderEncoderBert(torch.nn.Module):
             if 'table' in self.include_in_memory:
                 memory.append(t_enc_new_item)
             memory = torch.cat(memory, dim=1)
+
 
             result.append(SpiderEncoderState(
                 state=None,
@@ -944,6 +1034,7 @@ class SpiderEncoderBert(torch.nn.Module):
                 },
                 m2c_align_mat=align_mat_item[0],
                 m2t_align_mat=align_mat_item[1],
+                extra_input=None
             ))
         return result
 
@@ -1012,3 +1103,4 @@ class SpiderEncoderBert(torch.nn.Module):
             _tok_type_list = [0] * (first_sep_id + 1) + [1] * (max_len - first_sep_id - 1)
             tok_type_lists.append(_tok_type_list)
         return toks_ids, att_masks, tok_type_lists
+
