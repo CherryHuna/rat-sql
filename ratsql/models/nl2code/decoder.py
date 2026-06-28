@@ -760,7 +760,7 @@ class NL2CodeDecoder(torch.nn.Module):
 
             if(step < self.select_where_train_step):
                 if isinstance(node, dict) and (node['_type'] == 'sql_groupby' or node['_type'] == 'sql_orderby' or node['_type'] == 'sql_ieu'
-                or node['_type'] == 'from'):
+                or node['_type'] == 'sql_from'):
                     continue
 
             if isinstance(node, (list, tuple)):
