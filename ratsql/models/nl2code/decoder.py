@@ -767,6 +767,7 @@ class NL2CodeDecoder(torch.nn.Module):
                 node_type = parent_field_type + '*'
                 rule = (node_type, len(node))
                 rule_idx = self.rules_index[rule]
+                rule_idx = self.rules_index[rule]
 
                 assert traversal.cur_item.state == TreeTraversal.State.LIST_LENGTH_APPLY
                 traversal.step(rule_idx)
